@@ -10,7 +10,8 @@ echo 2. In REAPER:
 echo    Actions ^> Show action list ^> ReaScript: Load...
 echo    Pick reaper_agent_bridge.lua, then run it.
 echo.
-echo 3. To enable drum jobs for shell-less agents, double-click:
+echo 3. Optional: to let agents run external tools, register them in
+echo    bridge\bridge_config.json, then double-click:
 echo    %~dp0start_worker.bat
 echo.
 echo Opening this project folder and README now.

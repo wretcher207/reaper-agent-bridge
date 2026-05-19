@@ -1,0 +1,11 @@
+{
+  "id": "example-job",
+  "tool": "example_tool",
+  "params": {
+    "any_key": "becomes the {any_key} token in the tool's arg template"
+  },
+  "spec": {
+    "note": "Optional. Written to a file and exposed as {spec_file} when the tool has writes_spec: true."
+  },
+  "dry_run": true
+}

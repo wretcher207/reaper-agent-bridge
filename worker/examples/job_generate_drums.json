@@ -1,8 +1,10 @@
 {
-  "id": "manual-example-job",
-  "bpm": 130,
-  "bars": 4,
-  "out": "C:\\Users\\david\\workspace\\reaper-agent-bridge\\jobs_done\\drums_manual-example-job.mid",
+  "id": "drum-example-job",
+  "tool": "generate_drums",
+  "params": {
+    "bpm": 130,
+    "bars": 4
+  },
   "spec": {
     "seed": 777,
     "default": {
@@ -15,5 +17,6 @@
     "bars": {
       "0": { "crash": "right" }
     }
-  }
+  },
+  "dry_run": false
 }

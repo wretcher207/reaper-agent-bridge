@@ -1,6 +1,7 @@
--- REAPER Agent Bridge v2
+-- REAPER Agent Bridge v3
 -- Load this once in REAPER's Action List. It runs as a deferred script and
--- watches C:\Users\david\workspace\reaper-agent-bridge\inbox for JSON commands.
+-- watches <bridge_root>\inbox for JSON commands. The bridge root is the folder
+-- one level up from this script, so it works wherever the repo is cloned.
 
 local SCRIPT_PATH = ({ reaper.get_action_context() })[2] or ""
 local SCRIPT_DIR = SCRIPT_PATH:match("^(.*)[/\\][^/\\]+$") or "."
@@ -45,11 +46,9 @@ local function default_config()
     archive_successful_commands = true,
     allow_execute_lua = false,
     allow_risk_level_3 = false,
-    bridge_version = 2,
+    bridge_version = 3,
     default_timeout_ms = 30000,
-    python_exe = "",
-    drum_generator = "",
-    riff_analyzer = "",
+    tools = {},
   }
 end
 
@@ -80,11 +79,12 @@ local paths = {
   failed = root .. "\\failed",
   archive = root .. "\\archive",
   logs = root .. "\\logs",
+  recipes = root .. "\\recipes",
   heartbeat = root .. "\\bridge\\heartbeat.json",
 }
 
 -- Create the working folders if they are missing (fresh install or moved root).
-for _, dir in pairs({ paths.inbox, paths.processing, paths.outbox, paths.failed, paths.archive, paths.logs }) do
+for _, dir in pairs({ paths.inbox, paths.processing, paths.outbox, paths.failed, paths.archive, paths.logs, paths.recipes }) do
   if reaper.RecursiveCreateDirectory then reaper.RecursiveCreateDirectory(dir, 0) end
 end
 
@@ -775,10 +775,482 @@ local function command_write_fx_param_automation(command)
   }
 end
 
+-- ---------------------------------------------------------------------------
+-- Universal DAW verbs
+-- ---------------------------------------------------------------------------
+
+local function volume_from_db(db)
+  return 10.0 ^ (db / 20.0)
+end
+
+local function resolve_color(color)
+  if type(color) == "table" then
+    return reaper.ColorToNative(color.r or 0, color.g or 0, color.b or 0) | 0x1000000
+  end
+  if type(color) == "number" then return color end
+  error("BAD_COLOR: Provide a native color number or {r, g, b}")
+end
+
+local function track_summary(track)
+  local _, name = reaper.GetTrackName(track, "")
+  local index = math.floor(reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER"))
+  return { index = index, name = name, guid = reaper.GetTrackGUID(track) }
+end
+
+local function command_pause()
+  reaper.Main_OnCommand(1008, 0)
+  return { transport = get_transport() }
+end
+
+local function command_record()
+  reaper.Main_OnCommand(1013, 0)
+  return { transport = get_transport() }
+end
+
+local function command_set_cursor(command)
+  local payload = command.payload or {}
+  local time = resolve_position(payload.position or payload)
+  reaper.SetEditCurPos(time, payload.move_view ~= false, payload.seek_play == true)
+  return { cursor = { seconds = time, bar = bar_from_time(time) } }
+end
+
+local function command_set_time_selection(command)
+  local payload = command.payload or {}
+  if payload.clear == true then
+    reaper.GetSet_LoopTimeRange(true, payload.loop == true, 0, 0, false)
+    return { time_selection = { active = false } }
+  end
+  local start_time = resolve_position(payload.start or { type = "cursor" })
+  local end_time
+  if payload["end"] then
+    end_time = resolve_position(payload["end"])
+  elseif payload.length_bars then
+    end_time = time_from_bar(bar_from_time(start_time) + (tonumber(payload.length_bars) or 1))
+  else
+    error("BAD_RANGE: Provide end or length_bars")
+  end
+  reaper.GetSet_LoopTimeRange(true, payload.loop == true, start_time, end_time, false)
+  return { time_selection = get_time_selection() }
+end
+
+local function command_set_tempo(command)
+  local payload = command.payload or {}
+  local bpm = tonumber(payload.bpm)
+  if not bpm or bpm <= 0 then error("BAD_TEMPO: Provide a positive bpm") end
+  reaper.SetCurrentBPM(0, bpm, true)
+  return { tempo = reaper.Master_GetTempo() }
+end
+
+local function command_add_track(command)
+  local payload = command.payload or {}
+  local count = reaper.CountTracks(0)
+  local index = tonumber(payload.index)
+  if not index or index < 1 then index = count + 1 end
+  if index > count + 1 then index = count + 1 end
+  reaper.InsertTrackAtIndex(index - 1, true)
+  reaper.TrackList_AdjustWindows(false)
+  local track = reaper.GetTrack(0, index - 1)
+  if not track then error("ADD_TRACK_FAILED: REAPER did not create the track") end
+  if payload.name and payload.name ~= "" then
+    reaper.GetSetMediaTrackInfo_String(track, "P_NAME", tostring(payload.name), true)
+  end
+  if payload.color ~= nil then
+    reaper.SetMediaTrackInfo_Value(track, "I_CUSTOMCOLOR", resolve_color(payload.color))
+  end
+  if payload.select == true then reaper.SetOnlyTrackSelected(track) end
+  reaper.UpdateArrange()
+  return { track = track_summary(track) }
+end
+
+local function command_delete_track(command)
+  local track = find_track(command.payload or {})
+  local summary = track_summary(track)
+  reaper.DeleteTrack(track)
+  reaper.TrackList_AdjustWindows(false)
+  reaper.UpdateArrange()
+  return { deleted = summary }
+end
+
+local function command_rename_track(command)
+  local payload = command.payload or {}
+  local track = find_track(payload)
+  local new_name = payload.new_name or payload.name
+  if not new_name or new_name == "" then error("BAD_NAME: Provide new_name") end
+  reaper.GetSetMediaTrackInfo_String(track, "P_NAME", tostring(new_name), true)
+  reaper.TrackList_AdjustWindows(false)
+  return { track = track_summary(track) }
+end
+
+local function command_select_track(command)
+  local payload = command.payload or {}
+  local track = find_track(payload)
+  if payload.select == false then
+    reaper.SetTrackSelected(track, false)
+  elseif payload.exclusive == false then
+    reaper.SetTrackSelected(track, true)
+  else
+    reaper.SetOnlyTrackSelected(track)
+  end
+  reaper.UpdateArrange()
+  return { track = track_summary(track), selected = payload.select ~= false }
+end
+
+local function command_set_track_volume(command)
+  local payload = command.payload or {}
+  local track = find_track(payload)
+  local volume
+  if payload.volume_db ~= nil then
+    volume = volume_from_db(tonumber(payload.volume_db) or 0)
+  elseif payload.volume ~= nil then
+    volume = tonumber(payload.volume)
+  else
+    error("BAD_VALUE: Provide volume_db or volume")
+  end
+  if not volume or volume < 0 then error("BAD_VALUE: Volume must be a non-negative number") end
+  reaper.SetMediaTrackInfo_Value(track, "D_VOL", volume)
+  return { track = track_summary(track), volume = volume, volume_db = db_from_volume(volume) }
+end
+
+local function command_set_track_pan(command)
+  local payload = command.payload or {}
+  local track = find_track(payload)
+  local pan = tonumber(payload.pan)
+  if not pan then error("BAD_VALUE: Provide pan from -1.0 (left) to 1.0 (right)") end
+  if pan < -1 then pan = -1 end
+  if pan > 1 then pan = 1 end
+  reaper.SetMediaTrackInfo_Value(track, "D_PAN", pan)
+  return { track = track_summary(track), pan = pan }
+end
+
+local function command_mute_track(command)
+  local payload = command.payload or {}
+  local track = find_track(payload)
+  local mute = payload.mute ~= false
+  reaper.SetMediaTrackInfo_Value(track, "B_MUTE", mute and 1 or 0)
+  return { track = track_summary(track), muted = mute }
+end
+
+local function command_arm_track(command)
+  local payload = command.payload or {}
+  local track = find_track(payload)
+  local armed = payload.armed ~= false
+  reaper.SetMediaTrackInfo_Value(track, "I_RECARM", armed and 1 or 0)
+  return { track = track_summary(track), armed = armed }
+end
+
+local function command_add_fx(command)
+  local payload = command.payload or {}
+  local track = find_track(payload)
+  local fx_name = payload.fx_name
+  if not fx_name or fx_name == "" then error("BAD_FX_NAME: Provide fx_name") end
+  local scope = payload.fx_scope or payload.scope or "track"
+  local is_input = scope == "input" or scope == "rec" or scope == "record"
+  local fx_index = reaper.TrackFX_AddByName(track, fx_name, is_input, -1)
+  if not fx_index or fx_index < 0 then
+    error("ADD_FX_FAILED: REAPER could not add FX " .. tostring(fx_name) ..
+      " (name must match the plugin as REAPER lists it)")
+  end
+  local api_index = is_input and (0x1000000 + fx_index) or fx_index
+  local _, resolved_name = reaper.TrackFX_GetFXName(track, api_index, "")
+  if payload.show == true then reaper.TrackFX_Show(track, api_index, 1) end
+  return {
+    track = track_summary(track),
+    fx = { index = fx_index, api_index = api_index, scope = is_input and "input" or "track", name = resolved_name },
+  }
+end
+
+local function command_remove_fx(command)
+  local payload = command.payload or {}
+  local track, track_index, fx_index, fx_name, fx_scope, display_fx_index = find_fx(payload)
+  local ok = reaper.TrackFX_Delete(track, fx_index)
+  if not ok then error("REMOVE_FX_FAILED: REAPER rejected the FX delete") end
+  return {
+    track = track_summary(track),
+    removed = { index = display_fx_index or fx_index, scope = fx_scope or "track", name = fx_name },
+  }
+end
+
+local function command_bypass_fx(command)
+  local payload = command.payload or {}
+  local track, track_index, fx_index, fx_name, fx_scope, display_fx_index = find_fx(payload)
+  local bypass = payload.bypass ~= false
+  reaper.TrackFX_SetEnabled(track, fx_index, not bypass)
+  return {
+    track = track_summary(track),
+    fx = { index = display_fx_index or fx_index, scope = fx_scope or "track", name = fx_name, bypassed = bypass },
+  }
+end
+
+local function command_move_fx(command)
+  local payload = command.payload or {}
+  local track, track_index, fx_index, fx_name, fx_scope, display_fx_index = find_fx(payload)
+  if fx_scope == "input" then error("UNSUPPORTED: move_fx only supports track FX") end
+  local to_index = tonumber(payload.to_index)
+  if to_index == nil then error("BAD_VALUE: Provide to_index (0-based)") end
+  local fx_count = reaper.TrackFX_GetCount(track)
+  if to_index < 0 then to_index = 0 end
+  if to_index >= fx_count then to_index = fx_count - 1 end
+  reaper.TrackFX_CopyToTrack(track, fx_index, track, to_index, true)
+  return {
+    track = track_summary(track),
+    fx = { name = fx_name, from_index = display_fx_index or fx_index, to_index = to_index },
+  }
+end
+
+local function command_add_marker(command)
+  local payload = command.payload or {}
+  local time = resolve_position(payload.position or payload)
+  local color = payload.color ~= nil and resolve_color(payload.color) or 0
+  local index = reaper.AddProjectMarker2(0, false, time, 0, payload.name or "", payload.want_index or -1, color)
+  return { marker = { index = index, name = payload.name or "", seconds = time, bar = bar_from_time(time) } }
+end
+
+local function command_add_region(command)
+  local payload = command.payload or {}
+  local start_time = resolve_position(payload.start or payload.position or { type = "cursor" })
+  local end_time
+  if payload["end"] then
+    end_time = resolve_position(payload["end"])
+  elseif payload.length_bars then
+    end_time = time_from_bar(bar_from_time(start_time) + (tonumber(payload.length_bars) or 1))
+  else
+    error("BAD_RANGE: Provide end or length_bars")
+  end
+  local color = payload.color ~= nil and resolve_color(payload.color) or 0
+  local index = reaper.AddProjectMarker2(0, true, start_time, end_time, payload.name or "", payload.want_index or -1, color)
+  return {
+    region = {
+      index = index, name = payload.name or "",
+      start = start_time, ["end"] = end_time,
+      start_bar = bar_from_time(start_time), end_bar = bar_from_time(end_time),
+    },
+  }
+end
+
+local function command_delete_marker(command)
+  local payload = command.payload or {}
+  local is_region = payload.is_region == true or payload.type == "region"
+  if payload.marker_index ~= nil then
+    local ok = reaper.DeleteProjectMarker(0, tonumber(payload.marker_index), is_region)
+    if not ok then error("NO_MARKER: No marker/region with index " .. tostring(payload.marker_index)) end
+    return { deleted = { index = payload.marker_index, is_region = is_region } }
+  end
+  local needle = (payload.name or ""):lower()
+  if needle == "" then error("BAD_SELECTOR: Provide marker_index or name") end
+  local _, marker_count, region_count = reaper.CountProjectMarkers(0)
+  for i = 0, marker_count + region_count - 1 do
+    local ok, rgn, pos, rend, name, idx = reaper.EnumProjectMarkers3(0, i)
+    if ok and name and name:lower() == needle and rgn == is_region then
+      reaper.DeleteProjectMarker(0, idx, rgn)
+      return { deleted = { index = idx, name = name, is_region = rgn } }
+    end
+  end
+  error("NO_MARKER: No " .. (is_region and "region" or "marker") .. " named " .. tostring(payload.name))
+end
+
+local function command_delete_items_in_range(command)
+  local payload = command.payload or {}
+  local start_time, range_end = resolve_position(payload.range or payload.position or { type = "time_selection" })
+  local end_time = range_end
+  if not end_time then
+    if payload.length_bars then
+      end_time = time_from_bar(bar_from_time(start_time) + (tonumber(payload.length_bars) or 1))
+    elseif payload.length_seconds then
+      end_time = start_time + (tonumber(payload.length_seconds) or 0)
+    else
+      error("BAD_RANGE: range needs an explicit end, length_bars, or length_seconds")
+    end
+  end
+  local targets = {}
+  if payload.all_tracks == true then
+    for i = 0, reaper.CountTracks(0) - 1 do targets[#targets + 1] = reaper.GetTrack(0, i) end
+  else
+    targets[1] = (find_track(payload))
+  end
+  local removed = 0
+  for _, track in ipairs(targets) do
+    local before = reaper.CountTrackMediaItems(track)
+    delete_items_in_range(track, start_time, end_time)
+    removed = removed + (before - reaper.CountTrackMediaItems(track))
+  end
+  reaper.UpdateArrange()
+  return { removed_count = removed, range = { start = start_time, ["end"] = end_time } }
+end
+
+local function command_render(command)
+  if not config.allow_risk_level_3 then
+    error("RENDER_BLOCKED: render is gated; set allow_risk_level_3 true in bridge_config.json")
+  end
+  local payload = command.payload or {}
+  if payload.output_file and payload.output_file ~= "" then
+    reaper.GetSetProjectInfo_String(0, "RENDER_FILE", tostring(payload.output_file), true)
+  end
+  local bounds = { entire = 1, project = 1, time_selection = 2, regions = 3, selected_items = 4 }
+  if payload.bounds and bounds[payload.bounds] then
+    reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", bounds[payload.bounds], true)
+  end
+  -- Render with the project's most recent render settings (format, sample rate,
+  -- etc. must be configured once in REAPER's Render dialog).
+  reaper.Main_OnCommand(42230, 0)
+  return {
+    rendered = true,
+    output_file = select(2, reaper.GetSetProjectInfo_String(0, "RENDER_FILE", "", false)),
+    note = "Render used REAPER's last-saved render settings.",
+  }
+end
+
+-- ---------------------------------------------------------------------------
+-- Discovery
+-- ---------------------------------------------------------------------------
+
+local function scan_track_fx(track, include_values, max_params)
+  local entries = {}
+  local function scan(count, api_offset, scope)
+    for fx = 0, count - 1 do
+      local api_index = api_offset + fx
+      local _, fx_name = reaper.TrackFX_GetFXName(track, api_index, "")
+      local entry = {
+        index = fx, api_index = api_index, scope = scope, name = fx_name,
+        enabled = reaper.TrackFX_GetEnabled(track, api_index),
+        parameter_count = reaper.TrackFX_GetNumParams(track, api_index),
+      }
+      if include_values then
+        entry.parameters = {}
+        local limit = math.min(entry.parameter_count, max_params)
+        for p = 0, limit - 1 do
+          entry.parameters[#entry.parameters + 1] = get_fx_param_info(track, api_index, p)
+        end
+        entry.parameters_truncated = entry.parameter_count > limit
+      else
+        entry.parameters = {}
+        local limit = math.min(entry.parameter_count, max_params)
+        for p = 0, limit - 1 do
+          local _, pname = reaper.TrackFX_GetParamName(track, api_index, p, "")
+          entry.parameters[#entry.parameters + 1] = { index = p, name = pname }
+        end
+        entry.parameters_truncated = entry.parameter_count > limit
+      end
+      entries[#entries + 1] = entry
+    end
+  end
+  scan(reaper.TrackFX_GetCount(track), 0, "track")
+  if reaper.TrackFX_GetRecCount then
+    scan(reaper.TrackFX_GetRecCount(track), 0x1000000, "input")
+  end
+  return entries
+end
+
+local function command_scan_fx(command)
+  local payload = command.payload or {}
+  local include_values = payload.include_values == true
+  local max_params = math.max(1, math.min(2000, tonumber(payload.max_params or 500) or 500))
+  local tracks = {}
+  local total_fx = 0
+  if payload.target_track_name or payload.target_track_guid then
+    local track = find_track(payload)
+    local summary = track_summary(track)
+    summary.fx = scan_track_fx(track, include_values, max_params)
+    total_fx = total_fx + #summary.fx
+    tracks[1] = summary
+  else
+    for i = 0, reaper.CountTracks(0) - 1 do
+      local track = reaper.GetTrack(0, i)
+      local summary = track_summary(track)
+      summary.fx = scan_track_fx(track, include_values, max_params)
+      total_fx = total_fx + #summary.fx
+      tracks[#tracks + 1] = summary
+    end
+  end
+  return {
+    project_name = get_project_name(),
+    track_count = #tracks,
+    fx_count = total_fx,
+    include_values = include_values,
+    tracks = tracks,
+  }
+end
+
+-- ---------------------------------------------------------------------------
+-- Recipes — plugin-agnostic, reusable command sets an agent saves and replays
+-- ---------------------------------------------------------------------------
+
+local function safe_recipe_name(name)
+  if type(name) ~= "string" or name == "" then error("BAD_RECIPE_NAME: Provide a recipe name") end
+  if not name:match("^[%w%-_%. ]+$") then
+    error("BAD_RECIPE_NAME: Use only letters, numbers, space, dash, underscore, dot")
+  end
+  return name
+end
+
+local function recipe_path(name)
+  return paths.recipes .. "\\" .. name .. ".json"
+end
+
+local function command_save_recipe(command)
+  local payload = command.payload or {}
+  local name = safe_recipe_name(payload.name)
+  local commands = payload.commands or (payload.recipe and payload.recipe.commands)
+  if type(commands) ~= "table" or #commands == 0 then
+    error("BAD_RECIPE: Provide a non-empty commands array")
+  end
+  local recipe = {
+    name = name,
+    description = payload.description or (payload.recipe and payload.recipe.description) or "",
+    created_by = command.created_by or "agent",
+    saved_at = now(),
+    commands = commands,
+  }
+  atomic_write_json(recipe_path(name), recipe)
+  return { saved = name, path = recipe_path(name), command_count = #commands }
+end
+
+local function command_list_recipes()
+  local recipes = {}
+  local index = 0
+  while true do
+    local filename = reaper.EnumerateFiles(paths.recipes, index)
+    if not filename then break end
+    if filename:match("%.json$") and not filename:match("%.tmp$") then
+      local text = read_file(paths.recipes .. "\\" .. filename)
+      local ok, parsed = pcall(json.decode, text or "")
+      recipes[#recipes + 1] = {
+        name = filename:gsub("%.json$", ""),
+        description = (ok and type(parsed) == "table" and parsed.description) or "",
+        command_count = (ok and type(parsed) == "table" and parsed.commands and #parsed.commands) or 0,
+        saved_at = (ok and type(parsed) == "table" and parsed.saved_at) or nil,
+      }
+    end
+    index = index + 1
+  end
+  table.sort(recipes, function(a, b) return a.name < b.name end)
+  return { recipes = recipes, count = #recipes }
+end
+
+local function load_recipe(name)
+  local text = read_file(recipe_path(name))
+  if not text then error("NO_RECIPE: No recipe named " .. tostring(name)) end
+  local ok, parsed = pcall(json.decode, text)
+  if not ok or type(parsed) ~= "table" then error("BAD_RECIPE: Recipe file is not valid JSON") end
+  return parsed
+end
+
+local function command_get_recipe(command)
+  local name = safe_recipe_name((command.payload or {}).name)
+  return { recipe = load_recipe(name) }
+end
+
+-- forward declared; defined after run_command exists
+local command_apply_recipe
+
 local handlers = {}
 
+local READ_ONLY = {
+  get_context = true, get_fx_parameters = true, scan_fx = true,
+  list_recipes = true, get_recipe = true, save_recipe = true,
+}
+
 local function is_mutating(command_type)
-  return command_type ~= "get_context" and command_type ~= "get_fx_parameters"
+  return not READ_ONLY[command_type]
 end
 
 local function run_command(command, in_batch)
@@ -787,7 +1259,7 @@ local function run_command(command, in_batch)
   local handler = handlers[command.type]
   if not handler then error("UNKNOWN_COMMAND: " .. tostring(command.type)) end
 
-  if command.dry_run and command.type ~= "get_context" then
+  if command.dry_run and is_mutating(command.type) then
     return { dry_run = true, would_run = command.type, payload = command.payload or {} }
   end
 
@@ -803,16 +1275,58 @@ local function run_command(command, in_batch)
   return data
 end
 
+-- Read / context
 handlers.get_context = command_get_context
+handlers.get_fx_parameters = command_get_fx_parameters
+handlers.scan_fx = command_scan_fx
+
+-- Transport / project
 handlers.play = command_play
 handlers.stop = command_stop
-handlers.insert_midi_file = command_insert_midi_file
-handlers.audition_groove = command_audition_groove
+handlers.pause = command_pause
+handlers.record = command_record
+handlers.set_cursor = command_set_cursor
+handlers.set_time_selection = command_set_time_selection
+handlers.set_tempo = command_set_tempo
+handlers.render = command_render
+
+-- Track lifecycle
+handlers.add_track = command_add_track
+handlers.delete_track = command_delete_track
+handlers.rename_track = command_rename_track
+handlers.select_track = command_select_track
+
+-- Track properties
 handlers.set_track_color = command_set_track_color
+handlers.set_track_volume = command_set_track_volume
+handlers.set_track_pan = command_set_track_pan
+handlers.mute_track = command_mute_track
 handlers.solo_track = command_solo_track
-handlers.get_fx_parameters = command_get_fx_parameters
+handlers.arm_track = command_arm_track
+
+-- FX
+handlers.add_fx = command_add_fx
+handlers.remove_fx = command_remove_fx
+handlers.bypass_fx = command_bypass_fx
+handlers.move_fx = command_move_fx
 handlers.set_fx_param = command_set_fx_param
 handlers.write_fx_param_automation = command_write_fx_param_automation
+
+-- Markers / regions / items
+handlers.add_marker = command_add_marker
+handlers.add_region = command_add_region
+handlers.delete_marker = command_delete_marker
+handlers.delete_items_in_range = command_delete_items_in_range
+
+-- MIDI
+handlers.insert_midi_file = command_insert_midi_file
+handlers.audition_groove = command_audition_groove
+
+-- Recipes
+handlers.save_recipe = command_save_recipe
+handlers.list_recipes = command_list_recipes
+handlers.get_recipe = command_get_recipe
+handlers.apply_recipe = function(command) return command_apply_recipe(command) end
 
 handlers.batch = function(command)
   local payload = command.payload or {}
@@ -829,6 +1343,28 @@ handlers.batch = function(command)
   end
   reaper.Undo_EndBlock(command.undo_label or payload.undo_label or "Agent: batch", -1)
   return { results = results }
+end
+
+-- Defined here (not in the recipe section) because it replays commands through
+-- run_command, which only exists once handlers are registered.
+command_apply_recipe = function(command)
+  local payload = command.payload or {}
+  local name = safe_recipe_name(payload.name)
+  local recipe = load_recipe(name)
+  local commands = recipe.commands or {}
+  if #commands == 0 then error("EMPTY_RECIPE: Recipe " .. name .. " has no commands") end
+  local results = {}
+  reaper.Undo_BeginBlock()
+  for i, sub in ipairs(commands) do
+    local ok, data = pcall(run_command, sub, true)
+    results[#results + 1] = { index = i, type = sub.type, ok = ok, data = ok and data or nil, error = ok and nil or tostring(data) }
+    if not ok and payload.stop_on_error ~= false then
+      reaper.Undo_EndBlock("Agent: recipe " .. name .. " (failed)", -1)
+      error("RECIPE_FAILED: command " .. i .. " (" .. tostring(sub.type) .. ") failed: " .. tostring(data))
+    end
+  end
+  reaper.Undo_EndBlock(command.undo_label or ("Agent: recipe " .. name), -1)
+  return { recipe = name, results = results }
 end
 
 local function write_result(command, ok, data_or_error)

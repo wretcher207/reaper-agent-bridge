@@ -4,9 +4,15 @@
   "archive_successful_commands": true,
   "allow_execute_lua": false,
   "allow_risk_level_3": false,
-  "bridge_version": 2,
+  "bridge_version": 3,
   "default_timeout_ms": 30000,
-  "python_exe": "",
-  "drum_generator": "",
-  "riff_analyzer": ""
+  "tools": {
+    "example_tool": {
+      "exe": "C:\\Path\\To\\interpreter-or-program.exe",
+      "args": ["C:\\Path\\To\\script", "--input", "@{spec_file}", "--out", "{out}"],
+      "writes_spec": true,
+      "default_out": "{jobs_done}\\example_tool_{id}.out",
+      "output_key": "output_path"
+    }
+  }
 }

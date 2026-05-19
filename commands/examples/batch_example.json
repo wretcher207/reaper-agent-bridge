@@ -1,0 +1,28 @@
+{
+  "id": "<auto>",
+  "version": 2,
+  "type": "batch",
+  "created_by": "manual",
+  "created_at": "",
+  "dry_run": false,
+  "undo_label": "Agent: prep drum track",
+  "payload": {
+    "stop_on_error": true,
+    "commands": [
+      {
+        "type": "solo_track",
+        "payload": {
+          "target_track_name": "Odeholm Drums",
+          "solo": true
+        }
+      },
+      {
+        "type": "set_track_color",
+        "payload": {
+          "target_track_name": "Odeholm Drums",
+          "color": { "r": 180, "g": 20, "b": 20 }
+        }
+      }
+    ]
+  }
+}

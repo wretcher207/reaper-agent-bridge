@@ -1,0 +1,19 @@
+{
+  "id": "manual-example-job",
+  "bpm": 130,
+  "bars": 4,
+  "out": "C:\\Users\\david\\workspace\\reaper-agent-bridge\\jobs_done\\drums_manual-example-job.mid",
+  "spec": {
+    "seed": 777,
+    "default": {
+      "kick_notation": "-K--K---K-K--K--",
+      "snare_notation": "----S-------S---",
+      "power_hand": "china_r",
+      "subdivision": 16,
+      "humanize": 25
+    },
+    "bars": {
+      "0": { "crash": "right" }
+    }
+  }
+}

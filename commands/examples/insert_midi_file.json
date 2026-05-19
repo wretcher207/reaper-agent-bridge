@@ -1,0 +1,16 @@
+{
+  "id": "<auto>",
+  "version": 2,
+  "type": "insert_midi_file",
+  "created_by": "manual",
+  "created_at": "",
+  "dry_run": false,
+  "undo_label": "Agent: insert drum MIDI",
+  "payload": {
+    "midi_path": "C:\\Users\\david\\workspace\\reaper-tools\\generated_odeholm_drums.mid",
+    "position": { "type": "cursor" },
+    "length": { "type": "bars", "bars": 4 },
+    "loop": true,
+    "replace_existing_in_range": false
+  }
+}
